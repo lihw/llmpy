@@ -12,11 +12,11 @@ A shrinked Llama2 model
 @dataclass
 class LlamaConfig:
     dim: int = 1024
+    hidden_dim: int = 1440,
     vocab_size: int = 50304
     n_layer: int = 12
     n_heads: int = 4
     n_kv_heads: int = 4
-    n_embd: int = 1024
 
 class RMSNorm(torch.nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
@@ -310,7 +310,7 @@ class LlamaLayer(nn.Module):
         self.attention = Attention(args)
         self.feed_forward = FeedForward(
             dim = args.dim,
-            hidden_dim = 4 * args.dim,
+            hidden_dim = 4 * args.dim if args.hidden_dim is None else args.hidden_dim,
             multiple_of = args.multiple_of,
             ffn_dim_multiplier = args.ffn_dim_multiplier,
         )
