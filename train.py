@@ -2,12 +2,13 @@ import os
 import time
 import math
 import pickle
+import json
 from contextlib import nullcontext
 
 import numpy as np
 import torch
 
-from model import Llama, LlamaConfig
+from llama import Llama, LlamaConfig
 
 # I/O
 out_dir = 'out'
@@ -27,13 +28,14 @@ wandb_run_name = 'gpt2' # 'run' + str(time.time())
 dataset = 'openwebtext'
 gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
 batch_size = 4 # if gradient_accumulation_steps > 1, this is the micro-batch size
-dim = 1024 #The token dimension / the width of the transformer
 
 # model
 n_layers = 12
 n_heads = 12
-n_dim = 768
 n_kv_heads = 12
+max_seq_len = 256
+dim = 768
+hidden_dim = dim * 2
 bias = False # do we use bias inside LayerNorm and Linear layers?
 
 # adamw optimizer
@@ -52,31 +54,36 @@ min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchi
 
 # system
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
-dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = True # use PyTorch 2.0 to compile the model to be faster
-print(f"dtype: {dtype}")
+dtype = 'float16'
 
-# collect all parameters into a dic
+# collect all parameters into a dict
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 
-# -----------------------------------------------------------------------------
 # read specific configuration file
 exec(open('configurator.py').read()) # overrides from command line or config file
-config = {k: globals()[k] for k in config_keys} # will be useful for logging
-# -----------------------------------------------------------------------------
 
+## FIXME: use fp16 for training???
+dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() and device == 'cuda' else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
+
+config = {k: globals()[k] for k in config_keys} # will be useful for logging
+
+# print batch size
 tokens_per_iter = gradient_accumulation_steps * batch_size * dim
 print(f"tokens per iteration will be: {tokens_per_iter:,}")
+#  print all configuration
+print(json.dumps(config, sort_keys=False, indent=4))
 
-if master_process:
-    os.makedirs(out_dir, exist_ok=True)
+os.makedirs(out_dir, exist_ok = True)
 torch.manual_seed(1337)
 torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
 torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
 device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
+ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
 data_dir = os.path.join('data', dataset)
+
 def get_batch(split):
     # We recreate np.memmap every batch to avoid a memory leak, as per
     # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
@@ -84,9 +91,9 @@ def get_batch(split):
         data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
     else:
         data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
-    ix = torch.randint(len(data) - dim, (batch_size,)) # (batch_size, ) of uint32
-    x = torch.stack([torch.from_numpy((data[i : i + dim]).astype(np.int64)) for i in ix]) #(batch_size, dim)
-    y = torch.stack([torch.from_numpy((data[i + 1 : i + 1 + dim]).astype(np.int64)) for i in ix]) #(batch_size)
+    ix = torch.randint(len(data) - config["max_seq_len"], (batch_size,)) # (batch_size, ) of uint32
+    x = torch.stack([torch.from_numpy((data[i : i + config["max_seq_len"]]).astype(np.int64)) for i in ix]) #(batch_size, max_seq_len)
+    y = torch.stack([torch.from_numpy((data[i + 1 : i + 1 + config["max_seq_len"]]).astype(np.int64)) for i in ix]) #(batch_size, max_seq_len)
     if device_type == 'cuda':
         # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
         x, y = x.pin_memory().to(device, non_blocking = True), y.pin_memory().to(device, non_blocking=True)
@@ -94,14 +101,26 @@ def get_batch(split):
         x, y = x.to(device), y.to(device)
     return x, y
 
+# init vocab
+meta_path = os.path.join(data_dir, 'meta.pkl')
+meta_vocab_size = None
+if os.path.exists(meta_path):
+    with open(meta_path, 'rb') as f:
+        meta = pickle.load(f)
+    meta_vocab_size = meta['vocab_size']
+    print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
+
 # init model
 model_args = dict(n_layers = n_layers,
+        dim = dim,
+        hidden_dim = hidden_dim,
+        vocab_size = None,
         n_heads = n_heads,
         n_kv_heads = n_heads,
-        hidden_dim = hidden_dim,
-        dim = dim,
         bias = bias,
-        vocab_size = None) # start with model_args from command line
+        max_seq_len = max_seq_len,
+        max_batch_size = batch_size,
+        ) # start with model_args from command line
 
 if init_from == 'scratch':
     # init a new model from scratch
@@ -111,11 +130,11 @@ if init_from == 'scratch':
         print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
     model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
     llamaconf = LlamaConfig(**model_args)
-    model = Llama(gptconf)
+    model = Llama(llamaconf)
 
-if dim < model.config.dim:
-    model.crop_block_size(dim)
-    model_args['block_size'] = dim # so that the checkpoint will have the right value
+#if dim < model.config.dim:
+#    model.crop_block_size(dim)
+#    model_args['block_size'] = dim # so that the checkpoint will have the right value
 
 model.to(device)
 
@@ -142,7 +161,7 @@ def estimate_loss():
         for k in range(eval_iters):
             X, Y = get_batch(split)
             with ctx:
-                logits, loss = model(X, Y)
+                logits, loss = model(X, 0, Y)
             losses[k] = loss.item()
         out[split] = losses.mean()
     model.train()
@@ -185,11 +204,11 @@ while True:
     for _ in range(gradient_accumulation_steps):
         with ctx:
             # forward pass
-            logits, loss = model(X, Y)
+            logits, loss = model(X, 0, Y)
             loss = loss / gradient_accumulation_steps
 
         # backward pass, with gradient scaling if training in fp16
-        scalera.scale(loss).backward()
+        scaler.scale(loss).backward()
 
         # next micro_batch
         X, Y = get_batch('train')
@@ -222,7 +241,7 @@ while True:
     local_iter += 1
 
     # termination conditions
-    if iter_num > max_iters:
+    if iter > max_iters:
         break
 
 

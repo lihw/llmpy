@@ -1,4 +1,5 @@
 import math
+import inspect
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
@@ -9,14 +10,19 @@ from torch import nn
 """
 A shrinked Llama2 model
 """
+
+
 @dataclass
 class LlamaConfig:
-    dim: int = 1024
-    hidden_dim: int = 1440,
-    vocab_size: int = 50304
-    n_layer: int = 12
+    dim: int = 256
+    hidden_dim: int = 512
+    vocab_size: int = None
+    n_layers: int = 6
     n_heads: int = 4
     n_kv_heads: int = 4
+    bias : bool = False
+    max_seq_len: int = 256
+    max_batch_size: int = 64
 
 class RMSNorm(torch.nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
@@ -310,13 +316,13 @@ class LlamaLayer(nn.Module):
         self.attention = Attention(args)
         self.feed_forward = FeedForward(
             dim = args.dim,
-            hidden_dim = 4 * args.dim if args.hidden_dim is None else args.hidden_dim,
-            multiple_of = args.multiple_of,
-            ffn_dim_multiplier = args.ffn_dim_multiplier,
+            hidden_dim = args.hidden_dim,
+            multiple_of = 1,
+            ffn_dim_multiplier = None
         )
         self.layer_id = layer_id
-        self.attention_norm = RMSNorm(args.dim, eps = args.norm_eps)
-        self.ffn_norm = RMSNorm(args.dim, eps = args.norm_eps)
+        self.attention_norm = RMSNorm(args.dim)
+        self.ffn_norm = RMSNorm(args.dim)
 
     def forward(
         self,
@@ -371,17 +377,19 @@ class Llama(nn.Module):
         super().__init__()
         assert config.vocab_size is not None
         assert config.dim is not None
+
         self.config = config
 
-        self.tok_embd = ParallelEmbedding(self.config.vocab_size, self.config.dim)
-        self.layers   = [LlamaLayer(config) for _ in range(config.n_layer)]
-        self.norm     = RMSNorm(self.config.dim, eps = self.config.norm_eps)
+        self.tok_embd = nn.Embedding(self.config.vocab_size, self.config.dim)
+        self.layers   = [LlamaLayer(index, config) for index in range(config.n_layers)]
+        self.norm     = RMSNorm(self.config.dim)
         self.output   = nn.Linear(self.config.dim, self.config.vocab_size, bias = False)
 
+        # pre-compute rope frequencies
         self.freqs_cis = precompute_freqs_cis(
             # Note that self.params.max_seq_len is multiplied by 2 because the token limit for the Llama 2 generation of models is 4096.
             # Adding this multiplier instead of using 4096 directly allows for dynamism of token lengths while training or fine-tuning.
-            self.params.dim // self.params.n_heads, self.params.max_seq_len * 2
+            self.config.dim // self.config.n_heads, self.config.max_seq_len * 2
         )
 
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
@@ -394,12 +402,18 @@ class Llama(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, tokens: torch.Tensor, start_pos = int):
-        _, seqlen = tokens.shape
+    def forward(self, tokens: torch.Tensor, start_pos = int, targets: torch.Tensor = None):
+        _, seqlen = tokens.shape # (batch, seqlen)
 
-        h = self.tok_embd(tokens)
+        assert start_pos >= 0 and start_pos < self.config.max_seq_len
+        assert seqlen <= self.config.max_seq_len
 
-        # precompute rope frequencies
+        h = self.tok_embd(tokens) # (batch, seqlen, dim)
+        print(h.shape)
+
+        exit()
+
+        # rope frequencies for this batch
         self.freq_cis = self.freqs_cis.to(h.device) # (seqlen, dim / 2) complex
         freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
 
@@ -427,10 +441,18 @@ class Llama(nn.Module):
 
         output = self.output(h).float()
 
-        return output
+        # Training time
+        if targets is not None:
+            logits = output
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index = -1) # FIXME: ???
+        else:
+            logtis = output
+            loss = None
+
+        return logits, loss
 
 
-    def get_num_params(self, non_embedding=True):
+    def get_num_params(self):
         """
         Return the number of parameters in the model.
         For non-embedding count (default), the position embeddings get subtracted.
@@ -438,17 +460,41 @@ class Llama(nn.Module):
         params are actually used as weights in the final layer, so we include them.
         """
         n_params = sum(p.numel() for p in self.parameters())
-        if non_embedding:
-            n_params -= self.transformer.wpe.weight.numel()
         return n_params
 
-    def crop_block_size(self, block_size):
-        # model surgery to decrease the block size if necessary
-        # e.g. we may load the GPT2 pretrained model checkpoint (block size 1024)
-        # but want to use a smaller block size for some smaller, simpler model
-        assert block_size <= self.config.block_size
-        self.config.block_size = block_size
-        self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
-        for block in self.transformer.h:
-            if hasattr(block.attn, 'bias'):
-                block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]
+    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
+        # start with all of the candidate parameters
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        # filter out those that do not require grad
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+        # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
+        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        optim_groups = [
+            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': nodecay_params, 'weight_decay': 0.0}
+        ]
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nodecay_params = sum(p.numel() for p in nodecay_params)
+        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+        # Create AdamW optimizer and use the fused version if it is available
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and device_type == 'cuda'
+        extra_args = dict(fused=True) if use_fused else dict()
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
+        print(f"using fused AdamW: {use_fused}")
+
+        return optimizer
+
+    #def crop_block_size(self, max_seq_len):
+    #    # model surgery to decrease the block size if necessary
+    #    # e.g. we may load the GPT2 pretrained model checkpoint (block size 1024)
+    #    # but want to use a smaller block size for some smaller, simpler model
+    #    assert max_seq_len <= self.config.max_seq_len
+    #    self.config.max_seq_len = max_seq_len
+    #    self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
+    #    for block in self.transformer.h:
+    #        if hasattr(block.attn, 'bias'):
+    #            block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]

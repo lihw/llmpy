@@ -11,19 +11,19 @@ always_save_checkpoint = False
 
 wandb_log = False # override via command line if you like
 wandb_project = 'shakespeare-char'
-wandb_run_name = 'mini-gpt'
+wandb_run_name = 'mini-llama'
 
 dataset = 'shakespeare_char'
 gradient_accumulation_steps = 1
 batch_size = 64
-dim = 256 # context of up to 256 previous characters
-hidden_dim = 512
+max_seq_len = 256 # context of up to 256 previous characters
 
 # baby Llama model :)
 n_layers = 6
 n_heads = 6
 n_kv_heads = n_heads
-n_embd = 384
+dim = 384
+hidden_dim = 768
 
 learning_rate = 1e-3 # with baby networks can afford to go a bit higher
 max_iters = 5000
