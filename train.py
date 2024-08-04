@@ -55,7 +55,7 @@ min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchi
 # system
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 compile = True # use PyTorch 2.0 to compile the model to be faster
-dtype = 'float16'
+dtype = 'bfloat16'
 
 # collect all parameters into a dict
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
@@ -64,7 +64,7 @@ config_keys = [k for k,v in globals().items() if not k.startswith('_') and isins
 exec(open('configurator.py').read()) # overrides from command line or config file
 
 ## FIXME: use fp16 for training???
-dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() and device == 'cuda' else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
+dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
 
@@ -81,6 +81,7 @@ torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
 device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
+print(f"dtype: {dtype}")
 
 data_dir = os.path.join('data', dataset)
 
@@ -206,12 +207,12 @@ while True:
             # forward pass
             logits, loss = model(X, 0, Y)
             loss = loss / gradient_accumulation_steps
+        
+        # next micro_batch
+        X, Y = get_batch('train')
 
         # backward pass, with gradient scaling if training in fp16
         scaler.scale(loss).backward()
-
-        # next micro_batch
-        X, Y = get_batch('train')
 
     # clip the gradient
     if grad_clip != 0.0:

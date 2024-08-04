@@ -147,8 +147,7 @@ class Attention(nn.Module):
 
         Attributes:
             n_kv_heads (int): Number of key and value heads.
-            n_local_heads (int): Number of local query heads.
-            n_local_kv_heads (int): Number of local key and value heads.
+            n_heads (int): Number of local query heads.
             n_rep (int): Number of repetitions for local heads.
             head_dim (int): Dimension size of each attention head.
             wq (ColumnParallelLinear): Linear transformation for queries.
@@ -212,12 +211,12 @@ class Attention(nn.Module):
         bsz, seqlen, _ = x.shape
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
 
-        xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim) # (batch, seqlen, n_heads, head_dim)
-        xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim) # (batch, seqlen, n_heads, head_dim)
-        xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim) # (batch, seqlen, n_heads, head_dim)
+        xq = xq.view(bsz, seqlen, self.n_heads, self.head_dim) # (batch, seqlen, n_heads, head_dim)
+        xk = xk.view(bsz, seqlen, self.n_kv_heads, self.head_dim) # (batch, seqlen, n_heads, head_dim)
+        xv = xv.view(bsz, seqlen, self.n_kv_heads, self.head_dim) # (batch, seqlen, n_heads, head_dim)
 
         # apply rotatary position relative encoding
-        xq, xk = rope(xq, xk, self.freqs_cis)
+        xq, xk = rope(xq, xk, freqs_cis)
 
         # add k and v to the kvcache
         self.cache_k[:bsz, start_pos:seqlen] = xk
@@ -392,6 +391,8 @@ class Llama(nn.Module):
             self.config.dim // self.config.n_heads, self.config.max_seq_len * 2
         )
 
+        self.apply(self._init_weights)
+
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
 
     def _init_weights(self, module):
@@ -409,30 +410,27 @@ class Llama(nn.Module):
         assert seqlen <= self.config.max_seq_len
 
         h = self.tok_embd(tokens) # (batch, seqlen, dim)
-        print(h.shape)
-
-        exit()
 
         # rope frequencies for this batch
         self.freq_cis = self.freqs_cis.to(h.device) # (seqlen, dim / 2) complex
         freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
 
         mask = None
-        if seqlen > 1:
-            mask = torch.full(
-                (seqlen, seqlen), float("-inf"), device=tokens.device
-            )
+        #if seqlen > 1:
+        #    mask = torch.full(
+        #        (seqlen, seqlen), float("-inf"), device=tokens.device
+        #    )
 
-            mask = torch.triu(mask, diagonal=1)
+        #    mask = torch.triu(mask, diagonal=1)
 
-            # When performing key-value caching, we compute the attention scores
-            # only for the new sequence. Thus, the matrix of scores is of size
-            # (seqlen, cache_len + seqlen), and the only masked entries are (i, j) for
-            # j > cache_len + i, since row i corresponds to token cache_len + i.
-            mask = torch.hstack([
-                torch.zeros((seqlen, start_pos), device=tokens.device),
-                mask
-            ]).type_as(h)
+        #    # When performing key-value caching, we compute the attention scores
+        #    # only for the new sequence. Thus, the matrix of scores is of size
+        #    # (seqlen, cache_len + seqlen), and the only masked entries are (i, j) for
+        #    # j > cache_len + i, since row i corresponds to token cache_len + i.
+        #    mask = torch.hstack([
+        #        torch.zeros((seqlen, start_pos), device=tokens.device),
+        #        mask
+        #    ]).type_as(h)
 
         for layer in self.layers:
             h = layer(h, start_pos, freqs_cis, mask)
@@ -441,12 +439,14 @@ class Llama(nn.Module):
 
         output = self.output(h).float()
 
+        logits = output
+
         # Training time
         if targets is not None:
-            logits = output
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index = -1) # FIXME: ???
+            # logits.view(-1, logits.size(-1)), (batch * seqlen, vocab_size)
+            # targets.view(-1), (batch * seqlen, ), torch uses index instead one hot encoding to represent target.
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index = -1)
         else:
-            logtis = output
             loss = None
 
         return logits, loss
