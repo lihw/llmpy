@@ -385,7 +385,8 @@ class Llama(nn.Module):
             norm     = RMSNorm(self.config.dim)
             ))
 
-        self.output  = nn.Linear(self.config.dim, self.config.vocab_size, bias = False),
+        self.lm_head = nn.Linear(self.config.dim, self.config.vocab_size, bias = False)
+        self.transformer.tok_embd.weight = self.lm_head.weight
 
         # pre-compute rope frequencies
         self.freqs_cis = precompute_freqs_cis(
@@ -397,6 +398,18 @@ class Llama(nn.Module):
         self.apply(self._init_weights)
 
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
+
+    def get_num_params(self, non_embedding = True):
+        """
+        Return the number of parameters in the model.
+        For non-embedding count (default), the position embeddings get subtracted.
+        The token embeddings would too, except due to the parameter sharing these
+        params are actually used as weights in the final layer, so we include them.
+        """
+        n_params = sum(p.numel() for p in self.parameters())
+        if non_embedding:
+            n_params -= self.transformer.tok_embd.weight.numel()
+        return n_params
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -412,7 +425,6 @@ class Llama(nn.Module):
         assert start_pos >= 0 and start_pos < self.config.max_seq_len
         assert seqlen <= self.config.max_seq_len
 
-        h = self.transformer.tok_embd(tokens) # (batch, seqlen, dim)
 
         # rope frequencies for this batch
         self.freq_cis = self.freqs_cis.to(h.device) # (seqlen, dim / 2) complex
@@ -435,35 +447,25 @@ class Llama(nn.Module):
         #        mask
         #    ]).type_as(h)
 
+        h = self.transformer.tok_embd(tokens) # (batch, seqlen, dim)
+
         for layer in self.transformer.layers:
             h = layer(h, start_pos, freqs_cis, mask)
 
         h = self.transformer.norm(h)
 
-        o = self.output(h)
-
-        logits = o
-
         # Training time
         if targets is not None:
             # logits.view(-1, logits.size(-1)), (batch * seqlen, vocab_size)
             # targets.view(-1), (batch * seqlen, ), torch uses index instead one hot encoding to represent target.
+            logits = self.lm_head(x)
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index = -1)
         else:
+            logits = self.lm_head(x[:, [-1], :])
             loss = None
 
         return logits, loss
 
-
-    def get_num_params(self):
-        """
-        Return the number of parameters in the model.
-        For non-embedding count (default), the position embeddings get subtracted.
-        The token embeddings would too, except due to the parameter sharing these
-        params are actually used as weights in the final layer, so we include them.
-        """
-        n_params = sum(p.numel() for p in self.parameters())
-        return n_params
 
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
         # start with all of the candidate parameters

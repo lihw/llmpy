@@ -10,6 +10,7 @@ import torch
 
 from llama import Llama, LlamaConfig
 from gpt2 import GPT, GPTConfig
+from model import LLAMA
 
 # I/O
 out_dir = 'out'
@@ -155,8 +156,24 @@ if init_from == 'scratch':
         llamaconf = LlamaConfig(**model_args)
         model = Llama(llamaconf)
     else: # gpt2
-        gpt2conf = GPTConfig(**model_args)
-        model = GPT(gpt2conf)
+        config1 = {"vocab_size": meta_vocab_size,
+              "n_head": n_heads,
+              "hidden_size": dim,
+              "n_layer": n_layers,
+              "n_embd": dim,
+              "n_local_heads": n_heads,
+              "n_local_kv_heads": n_heads,
+              "eps": 1e-6,
+              "max_len": max_seq_len,
+              "rope_theta": 1.0,
+              "num_key_value_heads": n_heads,
+              "attention_dropout": 0.25,
+              "rms_norm_eps": 1.0,
+              "weight_decay": 0.1,
+              "block_size": max_seq_len}
+        model = LLAMA(config1)
+        #gpt2conf = GPTConfig(**model_args)
+        #model = GPT(gpt2conf)
 
 #if dim < model.config.dim:
 #    model.crop_block_size(dim)
@@ -259,9 +276,9 @@ while True:
         # get loss as float. note: this is a CPU-GPU sync point
         # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
         lossf = loss.item() * gradient_accumulation_steps
-        if local_iter >= 5: # let the training loop settle a bit
-            mfu = model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
-            running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
+        #if local_iter >= 5: # let the training loop settle a bit
+            #mfu = model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
+            #running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
         print(f"iter {iter}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
     iter += 1
     local_iter += 1
