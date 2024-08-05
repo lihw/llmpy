@@ -66,63 +66,92 @@ class RMSNorm(torch.nn.Module):
             torch.Tensor: The output tensor after applying RMSNorm.
 
         """
-        output = self._norm(x).type_as(x)
+        output = self._norm(x.float()).type_as(x)
         return output * self.weight
 
-def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
-    """
-    Reshape frequency tensor for broadcasting it with another tensor.
 
-    This function reshapes the frequency tensor to have the same shape as the target tensor 'x'
-    for the purpose of broadcasting the frequency tensor during element-wise operations.
+class RotaryEmbedding(nn.Module):
 
-    Args:
-        freqs_cis (torch.Tensor): Frequency tensor to be reshaped.
-        x (torch.Tensor): Target tensor for broadcasting compatibility.
+    # self.config.dim // self.config.n_heads, self.config.max_seq_len
+    def __init__(self, dim: int, end: int, theta: float = 10000.0):
 
-    Returns:
-        torch.Tensor: Reshaped frequency tensor.
+        """
+        Precompute the frequency tensor for complex exponentials (cis) with given dimensions.
 
-    Raises:
-        AssertionError: If the frequency tensor doesn't match the expected shape.
-        AssertionError: If the target tensor 'x' doesn't have the expected number of dimensions.
-    """
-    ndim = x.ndim
-    assert 0 <= 1 < ndim
-    assert freqs_cis.shape == (x.shape[1], x.shape[-1]) # x: (bsz, seq_len, n_heads, head_dim / 2)
-    shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)] # (1, seq_len, 1, head_dim / 2)
-    return freqs_cis.view(*shape)
+        This function calculates a frequency tensor with complex exponentials using the given dimension 'dim'
+        and the end index 'end'. The 'theta' parameter scales the frequencies.
+        The returned tensor contains complex values in complex64 data type.
 
-def rope(
-    xq: torch.Tensor,
-    xk: torch.Tensor,
-    freqs_cis: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Apply rotary embeddings to input tensors using the given frequency tensor.
+        Args:
+            dim (int): Dimension of the frequency tensor.
+            end (int): End index for precomputing frequencies.
+            theta (float, optional): Scaling factor for frequency computation. Defaults to 10000.0.
 
-    This function applies rotary embeddings to the given query 'xq' and key 'xk' tensors using the provided
-    frequency tensor 'freqs_cis'. The input tensors are reshaped as complex numbers, and the frequency tensor
-    is reshaped for broadcasting compatibility. The resulting tensors contain rotary embeddings and are
-    returned as real tensors.
+        Returns:
+            torch.Tensor: Precomputed frequency tensor with complex exponentials.
+        """
+        super().__init__()
 
-    Args:
-        xq (torch.Tensor): Query tensor to apply rotary embeddings.
-        xk (torch.Tensor): Key tensor to apply rotary embeddings.
-        freqs_cis (torch.Tensor): Precomputed frequency tensor for complex exponentials.
+        freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
+        t = torch.arange(end, device=freqs.device)  # type: ignore
+        freqs = torch.outer(t, freqs)  # type: ignore
+        self.freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
 
-    Returns:
-        Tuple[torch.Tensor, torch.Tensor]: Tuple of modified query tensor and key tensor with rotary embeddings.
+    def reshape_for_broadcast(self, x: torch.Tensor):
+        """
+        Reshape frequency tensor for broadcasting it with another tensor.
 
+        This function reshapes the frequency tensor to have the same shape as the target tensor 'x'
+        for the purpose of broadcasting the frequency tensor during element-wise operations.
 
+        Args:
+            freqs_cis (torch.Tensor): Frequency tensor to be reshaped.
+            x (torch.Tensor): Target tensor for broadcasting compatibility.
 
-    """
-    xq_ = torch.view_as_complex(xq.reshape(*xq.shape[:-1], -1, 2)) # (bsz, seq_len, n_heads, head_dim / 2, 2)
-    xk_ = torch.view_as_complex(xk.reshape(*xk.shape[:-1], -1, 2)) # (bsz, seq_len, n_heads, head_dim / 2, 2)
-    freqs_cis = reshape_for_broadcast(freqs_cis, xq_) # (1, seq_len, 1, head_dim / 2)
-    xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3) # ???
-    xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
-    return xq_out.type_as(xq), xk_out.type_as(xk)
+        Returns:
+            torch.Tensor: Reshaped frequency tensor.
+
+        Raises:
+            AssertionError: If the frequency tensor doesn't match the expected shape.
+            AssertionError: If the target tensor 'x' doesn't have the expected number of dimensions.
+        """
+        ndim = x.ndim
+        assert 0 <= 1 < ndim
+        assert self.freqs_cis.shape == (x.shape[1], x.shape[-1]) # x: (bsz, seq_len, n_heads, head_dim / 2)
+        shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)] # (1, seq_len, 1, head_dim / 2)
+        return self.freqs_cis.view(*shape)
+
+    def forward(
+        self,
+        xq: torch.Tensor,
+        xk: torch.Tensor,
+    ):
+        """
+        Apply rotary embeddings to input tensors using the given frequency tensor.
+
+        This function applies rotary embeddings to the given query 'xq' and key 'xk' tensors using the provided
+        frequency tensor 'freqs_cis'. The input tensors are reshaped as complex numbers, and the frequency tensor
+        is reshaped for broadcasting compatibility. The resulting tensors contain rotary embeddings and are
+        returned as real tensors.
+
+        Args:
+            xq (torch.Tensor): Query tensor to apply rotary embeddings.
+            xk (torch.Tensor): Key tensor to apply rotary embeddings.
+            freqs_cis (torch.Tensor): Precomputed frequency tensor for complex exponentials.
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]: Tuple of modified query tensor and key tensor with rotary embeddings.
+        """
+
+        xq_ = torch.view_as_complex(xq.reshape(*xq.shape[:-1], -1, 2)) # (bsz, seq_len, n_heads, head_dim / 2, 2)
+        xk_ = torch.view_as_complex(xk.reshape(*xk.shape[:-1], -1, 2)) # (bsz, seq_len, n_heads, head_dim / 2, 2)
+
+        freqs_cis = self.reshape_for_broadcast(xq_) # (1, seq_len, 1, head_dim / 2)
+
+        xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
+        xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
+
+        return xq_out.type_as(xq), xk_out.type_as(xk)
 
 
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -170,29 +199,12 @@ class Attention(nn.Module):
         self.wv = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias = False)
         self.wo = nn.Linear(args.n_heads * self.head_dim, args.dim, bias = False)
 
-        self.cache_k = torch.zeros(
-            (
-                args.max_batch_size,  # B x S x T
-                args.max_seq_len,
-                self.n_kv_heads,
-                self.head_dim,
-            )
-        )
-
-        self.cache_v = torch.zeros(
-            (
-                args.max_batch_size,
-                args.max_seq_len,
-                self.n_kv_heads,
-                self.head_dim,
-            )
-        )
+        self.rope = RotaryEmbedding(self.head_dim, args.max_seq_len)
 
     def forward(
         self,
         x: torch.Tensor,
         start_pos: int,
-        freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
     ):
         """
@@ -201,7 +213,6 @@ class Attention(nn.Module):
         Args:
             x (torch.Tensor): Input tensor.
             start_pos (int): Starting position for caching.
-            freqs_cis (torch.Tensor): Precomputed frequency tensor.
             mask (torch.Tensor, optional): Attention mask tensor.
 
         Returns:
@@ -216,25 +227,30 @@ class Attention(nn.Module):
         xv = xv.view(bsz, seqlen, self.n_kv_heads, self.head_dim) # (batch, seqlen, n_heads, head_dim)
 
         # apply rotatary position relative encoding
-        xq, xk = rope(xq, xk, freqs_cis)
+        xq, xk = self.rope(xq, xk)
 
         # add k and v to the kvcache
-        self.cache_k[:bsz, start_pos:seqlen] = xk
-        self.cache_v[:bsz, start_pos:seqlen] = xv
+        #self.cache_k[:bsz, start_pos:seqlen] = xk
+        #self.cache_v[:bsz, start_pos:seqlen] = xv
 
-        keys = self.cache_k[:bsz, :seqlen]   # (batch, cache_len + seqlen, n_heads, head_dim)
-        values = self.cache_v[:bsz, :seqlen] # (batch, cache_len + seqlen, n_heads, head_dim)
+        #keys = self.cache_k[:bsz, :seqlen]   # (batch, cache_len + seqlen, n_heads, head_dim)
+        #values = self.cache_v[:bsz, :seqlen] # (batch, cache_len + seqlen, n_heads, head_dim)
+
+        keys = xk
+        values = xv
 
         # compute attenion
-        repeat_kv(keys, self.n_rep)
-        repeat_kv(values, self.n_rep)
+        keys = repeat_kv(keys, self.n_rep)
+        values = repeat_kv(values, self.n_rep)
 
         xq = xq.transpose(1, 2) # (batch, n_heads, seqlen, head_dim)
         keys = keys.transpose(1, 2) # (batch, n_heads, cache_len + seqlen, head_dim)
         values = values.transpose(1, 2) # (batch, n_heads, cache_len + seqlen, head_dim)
+
         scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim) # attention (batch, n_heads, seqlen, cache_len + seqlen)
         if mask is not None:
             scores = scores + mask
+
         scores = torch.softmax(scores, dim = -1).type_as(xq)
 
         # weighed sum of values
@@ -248,10 +264,7 @@ class FeedForward(nn.Module):
     def __init__(
         self,
         dim: int,
-        hidden_dim: int,
-        multiple_of: int,
-        ffn_dim_multiplier: Optional[float],
-    ):
+        hidden_dim: int):
         """
         Initialize the FeedForward module.
 
@@ -269,11 +282,7 @@ class FeedForward(nn.Module):
         """
         super().__init__()
 
-        hidden_dim = int(2 * hidden_dim / 3)
-        # custom dim factor multiplier
-        if ffn_dim_multiplier is not None:
-            hidden_dim = int(ffn_dim_multiplier * hidden_dim)
-        hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
+        hidden_dim = int(4 * hidden_dim / 3)
 
         self.w1 = nn.Linear(
             dim, hidden_dim, bias = False,
@@ -315,9 +324,7 @@ class LlamaLayer(nn.Module):
         self.attention = Attention(args)
         self.feed_forward = FeedForward(
             dim = args.dim,
-            hidden_dim = args.hidden_dim,
-            multiple_of = 1,
-            ffn_dim_multiplier = None
+            hidden_dim = args.hidden_dim
         )
         self.layer_id = layer_id
         self.attention_norm = RMSNorm(args.dim)
@@ -327,7 +334,6 @@ class LlamaLayer(nn.Module):
         self,
         x: torch.Tensor,
         start_pos: int,
-        freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
     ):
         """
@@ -336,7 +342,6 @@ class LlamaLayer(nn.Module):
         Args:
             x (torch.Tensor): Input tensor.
             start_pos (int): Starting position for attention caching.
-            freqs_cis (torch.Tensor): Precomputed cosine and sine frequencies.
             mask (torch.Tensor, optional): Masking tensor for attention. Defaults to None.
 
         Returns:
@@ -344,32 +349,11 @@ class LlamaLayer(nn.Module):
 
         """
         h = x + self.attention(
-            self.attention_norm(x), start_pos, freqs_cis, mask
+            self.attention_norm(x), start_pos, mask
         )
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
 
-def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
-    """
-    Precompute the frequency tensor for complex exponentials (cis) with given dimensions.
-
-    This function calculates a frequency tensor with complex exponentials using the given dimension 'dim'
-    and the end index 'end'. The 'theta' parameter scales the frequencies.
-    The returned tensor contains complex values in complex64 data type.
-
-    Args:
-        dim (int): Dimension of the frequency tensor.
-        end (int): End index for precomputing frequencies.
-        theta (float, optional): Scaling factor for frequency computation. Defaults to 10000.0.
-
-    Returns:
-        torch.Tensor: Precomputed frequency tensor with complex exponentials.
-    """
-    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
-    t = torch.arange(end, device=freqs.device)  # type: ignore
-    freqs = torch.outer(t, freqs)  # type: ignore
-    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
-    return freqs_cis
 
 class Llama(nn.Module):
     def __init__(self, config: LlamaConfig):
@@ -387,13 +371,6 @@ class Llama(nn.Module):
 
         self.lm_head = nn.Linear(self.config.dim, self.config.vocab_size, bias = False)
         self.transformer.tok_embd.weight = self.lm_head.weight
-
-        # pre-compute rope frequencies
-        self.freqs_cis = precompute_freqs_cis(
-            # Note that self.params.max_seq_len is multiplied by 2 because the token limit for the Llama 2 generation of models is 4096.
-            # Adding this multiplier instead of using 4096 directly allows for dynamism of token lengths while training or fine-tuning.
-            self.config.dim // self.config.n_heads, self.config.max_seq_len * 2
-        )
 
         self.apply(self._init_weights)
 
@@ -425,11 +402,6 @@ class Llama(nn.Module):
         assert start_pos >= 0 and start_pos < self.config.max_seq_len
         assert seqlen <= self.config.max_seq_len
 
-
-        # rope frequencies for this batch
-        self.freq_cis = self.freqs_cis.to(h.device) # (seqlen, dim / 2) complex
-        freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
-
         mask = None
         #if seqlen > 1:
         #    mask = torch.full(
@@ -450,7 +422,7 @@ class Llama(nn.Module):
         h = self.transformer.tok_embd(tokens) # (batch, seqlen, dim)
 
         for layer in self.transformer.layers:
-            h = layer(h, start_pos, freqs_cis, mask)
+            h = layer(h, start_pos, mask)
 
         h = self.transformer.norm(h)
 
@@ -458,10 +430,10 @@ class Llama(nn.Module):
         if targets is not None:
             # logits.view(-1, logits.size(-1)), (batch * seqlen, vocab_size)
             # targets.view(-1), (batch * seqlen, ), torch uses index instead one hot encoding to represent target.
-            logits = self.lm_head(x)
+            logits = self.lm_head(h)
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index = -1)
         else:
-            logits = self.lm_head(x[:, [-1], :])
+            logits = self.lm_head(h[:, [-1], :])
             loss = None
 
         return logits, loss

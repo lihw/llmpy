@@ -18,14 +18,14 @@ gradient_accumulation_steps = 1
 batch_size = 64
 max_seq_len = 256 # context of up to 256 previous characters
 
-model_type = "LLAMA"
+model_type = "llama"
 
 # baby Llama model :)
-n_layers = 8
-n_heads = 8
+n_layers = 6
+n_heads = 4
 n_kv_heads = n_heads
-dim = 256
-hidden_dim = 512
+dim = 128
+hidden_dim = 256
 
 # baby gpt model :)
 block_size = 256 # context of up to 256 previous characters
