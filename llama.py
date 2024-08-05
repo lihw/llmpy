@@ -66,7 +66,7 @@ class RMSNorm(torch.nn.Module):
             torch.Tensor: The output tensor after applying RMSNorm.
 
         """
-        output = self._norm(x.float()).type_as(x)
+        output = self._norm(x).type_as(x)
         return output * self.weight
 
 def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
@@ -117,8 +117,8 @@ def rope(
 
 
     """
-    xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2)) # (bsz, seq_len, n_heads, head_dim / 2, 2)
-    xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2)) # (bsz, seq_len, n_heads, head_dim / 2, 2)
+    xq_ = torch.view_as_complex(xq.reshape(*xq.shape[:-1], -1, 2)) # (bsz, seq_len, n_heads, head_dim / 2, 2)
+    xk_ = torch.view_as_complex(xk.reshape(*xk.shape[:-1], -1, 2)) # (bsz, seq_len, n_heads, head_dim / 2, 2)
     freqs_cis = reshape_for_broadcast(freqs_cis, xq_) # (1, seq_len, 1, head_dim / 2)
     xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3) # ???
     xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
@@ -235,7 +235,7 @@ class Attention(nn.Module):
         scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim) # attention (batch, n_heads, seqlen, cache_len + seqlen)
         if mask is not None:
             scores = scores + mask
-        scores = torch.softmax(scores.float(), dim = -1).type_as(xq)
+        scores = torch.softmax(scores, dim = -1).type_as(xq)
 
         # weighed sum of values
         output = torch.matmul(scores, values) # (batch, n_heads, seqlen, head_dim)
@@ -367,7 +367,7 @@ def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
     """
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
     t = torch.arange(end, device=freqs.device)  # type: ignore
-    freqs = torch.outer(t, freqs).float()  # type: ignore
+    freqs = torch.outer(t, freqs)  # type: ignore
     freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
     return freqs_cis
 
@@ -379,10 +379,13 @@ class Llama(nn.Module):
 
         self.config = config
 
-        self.tok_embd = nn.Embedding(self.config.vocab_size, self.config.dim)
-        self.layers   = [LlamaLayer(index, config) for index in range(config.n_layers)]
-        self.norm     = RMSNorm(self.config.dim)
-        self.output   = nn.Linear(self.config.dim, self.config.vocab_size, bias = False)
+        self.transformer = nn.ModuleDict(dict(
+            tok_embd = nn.Embedding(self.config.vocab_size, self.config.dim),
+            layers   = nn.ModuleList([LlamaLayer(index, config) for index in range(config.n_layers)]),
+            norm     = RMSNorm(self.config.dim)
+            ))
+
+        self.output  = nn.Linear(self.config.dim, self.config.vocab_size, bias = False),
 
         # pre-compute rope frequencies
         self.freqs_cis = precompute_freqs_cis(
@@ -403,13 +406,13 @@ class Llama(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, tokens: torch.Tensor, start_pos = int, targets: torch.Tensor = None):
+    def forward(self, tokens: torch.Tensor, targets: torch.Tensor = None, start_pos = 0):
         _, seqlen = tokens.shape # (batch, seqlen)
 
         assert start_pos >= 0 and start_pos < self.config.max_seq_len
         assert seqlen <= self.config.max_seq_len
 
-        h = self.tok_embd(tokens) # (batch, seqlen, dim)
+        h = self.transformer.tok_embd(tokens) # (batch, seqlen, dim)
 
         # rope frequencies for this batch
         self.freq_cis = self.freqs_cis.to(h.device) # (seqlen, dim / 2) complex
@@ -432,14 +435,14 @@ class Llama(nn.Module):
         #        mask
         #    ]).type_as(h)
 
-        for layer in self.layers:
+        for layer in self.transformer.layers:
             h = layer(h, start_pos, freqs_cis, mask)
 
-        h = self.norm(h)
+        h = self.transformer.norm(h)
 
-        output = self.output(h).float()
+        o = self.output(h)
 
-        logits = output
+        logits = o
 
         # Training time
         if targets is not None:

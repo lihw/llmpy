@@ -9,6 +9,7 @@ import numpy as np
 import torch
 
 from llama import Llama, LlamaConfig
+from gpt2 import GPT, GPTConfig
 
 # I/O
 out_dir = 'out'
@@ -30,6 +31,9 @@ gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
 batch_size = 4 # if gradient_accumulation_steps > 1, this is the micro-batch size
 
 # model
+model_type = "gpt"
+
+# llama model
 n_layers = 12
 n_heads = 12
 n_kv_heads = 12
@@ -37,6 +41,10 @@ max_seq_len = 256
 dim = 768
 hidden_dim = dim * 2
 bias = False # do we use bias inside LayerNorm and Linear layers?
+
+# gpt2 model
+block_size = 1024
+dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
@@ -73,6 +81,9 @@ tokens_per_iter = gradient_accumulation_steps * batch_size * dim
 print(f"tokens per iteration will be: {tokens_per_iter:,}")
 #  print all configuration
 print(json.dumps(config, sort_keys=False, indent=4))
+
+# the global var doesn't sync with config file
+device = config["device"]
 
 os.makedirs(out_dir, exist_ok = True)
 torch.manual_seed(1337)
@@ -112,16 +123,25 @@ if os.path.exists(meta_path):
     print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
 
 # init model
-model_args = dict(n_layers = n_layers,
-        dim = dim,
-        hidden_dim = hidden_dim,
-        vocab_size = None,
-        n_heads = n_heads,
-        n_kv_heads = n_heads,
-        bias = bias,
-        max_seq_len = max_seq_len,
-        max_batch_size = batch_size,
-        ) # start with model_args from command line
+if model_type == "llama":
+    model_args = dict(n_layers = n_layers,
+            dim = dim,
+            hidden_dim = hidden_dim,
+            vocab_size = None,
+            n_heads = n_heads,
+            n_kv_heads = n_heads,
+            bias = bias,
+            max_seq_len = max_seq_len,
+            max_batch_size = batch_size,
+            ) # start with model_args from command line
+else: #gpt2
+    model_args = dict(n_layer = n_layers,
+            n_head = n_heads,
+            n_embd = dim,
+            block_size = block_size,
+            bias = bias,
+            vocab_size = None,
+            dropout=dropout) # start with model_args from command line
 
 if init_from == 'scratch':
     # init a new model from scratch
@@ -130,8 +150,13 @@ if init_from == 'scratch':
     if meta_vocab_size is None:
         print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
     model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
-    llamaconf = LlamaConfig(**model_args)
-    model = Llama(llamaconf)
+
+    if model_type == "llama":
+        llamaconf = LlamaConfig(**model_args)
+        model = Llama(llamaconf)
+    else: # gpt2
+        gpt2conf = GPTConfig(**model_args)
+        model = GPT(gpt2conf)
 
 #if dim < model.config.dim:
 #    model.crop_block_size(dim)
@@ -162,7 +187,7 @@ def estimate_loss():
         for k in range(eval_iters):
             X, Y = get_batch(split)
             with ctx:
-                logits, loss = model(X, 0, Y)
+                logits, loss = model(X, Y)
             losses[k] = loss.item()
         out[split] = losses.mean()
     model.train()
@@ -183,7 +208,7 @@ def get_lr(it):
     return min_lr + coeff * (learning_rate - min_lr)
 
 # logging
-if wandb_log and master_process:
+if wandb_log:
     import wandb
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
@@ -205,9 +230,9 @@ while True:
     for _ in range(gradient_accumulation_steps):
         with ctx:
             # forward pass
-            logits, loss = model(X, 0, Y)
+            logits, loss = model(X, Y)
             loss = loss / gradient_accumulation_steps
-        
+
         # next micro_batch
         X, Y = get_batch('train')
 
