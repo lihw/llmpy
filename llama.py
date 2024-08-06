@@ -403,21 +403,29 @@ class Llama(nn.Module):
         assert seqlen <= self.config.max_seq_len
 
         mask = None
-        #if seqlen > 1:
-        #    mask = torch.full(
-        #        (seqlen, seqlen), float("-inf"), device=tokens.device
-        #    )
+        if seqlen > 1:
+            # The left upper triangular matrix (without diagonal) is full of -inf
+            mask = torch.full(
+                (seqlen, seqlen), float("-inf"), device=tokens.device
+            )
+            mask = torch.triu(mask, diagonal = 1)
 
-        #    mask = torch.triu(mask, diagonal=1)
-
-        #    # When performing key-value caching, we compute the attention scores
-        #    # only for the new sequence. Thus, the matrix of scores is of size
-        #    # (seqlen, cache_len + seqlen), and the only masked entries are (i, j) for
-        #    # j > cache_len + i, since row i corresponds to token cache_len + i.
-        #    mask = torch.hstack([
-        #        torch.zeros((seqlen, start_pos), device=tokens.device),
-        #        mask
-        #    ]).type_as(h)
+            # When performing key-value caching, we compute the attention scores
+            # only for the new sequence. Thus, the matrix of scores is of size
+            # (seqlen, cache_len + seqlen), and the only masked entries are (i, j) for
+            # j > cache_len + i, since row i corresponds to token cache_len + i.
+            #
+            # Say start_pos being 3, and seqlen being 4, the mask will be
+            #
+            # 0 0 0   0  -inf -inf -inf
+            # 0 0 0   0   0   -inf -inf
+            # 0 0 0   0   0     0  -inf
+            # 0 0 0   0   0     0    0
+            #
+            mask = torch.hstack([
+                torch.zeros((seqlen, start_pos), device = tokens.device),
+                mask
+            ]).type_as(tokens)
 
         h = self.transformer.tok_embd(tokens) # (batch, seqlen, dim)
 

@@ -24,8 +24,8 @@ model_type = "llama"
 n_layers = 6
 n_heads = 4
 n_kv_heads = n_heads
-dim = 128
-hidden_dim = 256
+dim = 64
+hidden_dim = 128
 
 # baby gpt model :)
 block_size = 256 # context of up to 256 previous characters
