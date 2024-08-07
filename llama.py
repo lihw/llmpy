@@ -93,7 +93,7 @@ class RotaryEmbedding(nn.Module):
         super().__init__()
 
         freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
-        t = torch.arange(end, device=freqs.device)  # type: ignore
+        t = torch.arange(end, device = freqs.device)  # type: ignore
         freqs = torch.outer(t, freqs)  # type: ignore
         self.freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
 
@@ -116,10 +116,15 @@ class RotaryEmbedding(nn.Module):
             AssertionError: If the target tensor 'x' doesn't have the expected number of dimensions.
         """
         ndim = x.ndim
-        assert 0 <= 1 < ndim
-        assert self.freqs_cis.shape == (x.shape[1], x.shape[-1]) # x: (bsz, seq_len, n_heads, head_dim / 2)
-        shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)] # (1, seq_len, 1, head_dim / 2)
-        return self.freqs_cis.view(*shape)
+        assert 1 < ndim
+        assert self.freqs_cis.shape[-1] == x.shape[-1] # freqs_cis: (max_seq_len, head_dim / 2), x: (bsz, seq_len, n_heads, head_dim / 2)
+        max_seq_len = self.freqs_cis.shape[0]
+        seq_len = x.shape[1]
+        assert  max_seq_len >= seq_len
+
+        shape = [d if i == ndim - 1 else 1 for i, d in enumerate(x.shape)] # (1, seq_len, 1, head_dim / 2)
+        shape[1] = max_seq_len # (1, max_seq_len, 1, head_dim / 2)
+        return self.freqs_cis.view(*shape)[:, :seq_len, :, :]
 
     def forward(
         self,
@@ -143,8 +148,12 @@ class RotaryEmbedding(nn.Module):
             Tuple[torch.Tensor, torch.Tensor]: Tuple of modified query tensor and key tensor with rotary embeddings.
         """
 
-        xq_ = torch.view_as_complex(xq.reshape(*xq.shape[:-1], -1, 2)) # (bsz, seq_len, n_heads, head_dim / 2, 2)
-        xk_ = torch.view_as_complex(xk.reshape(*xk.shape[:-1], -1, 2)) # (bsz, seq_len, n_heads, head_dim / 2, 2)
+        # in case the internal precomputed data are on the different device of current model
+        if self.freqs_cis.device != xq.device:
+            self.freqs_cis = self.freqs_cis.to(xq.device)
+
+        xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2)) # (bsz, seq_len, n_heads, head_dim / 2, 2)
+        xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2)) # (bsz, seq_len, n_heads, head_dim / 2, 2)
 
         freqs_cis = self.reshape_for_broadcast(xq_) # (1, seq_len, 1, head_dim / 2)
 
@@ -472,6 +481,34 @@ class Llama(nn.Module):
         print(f"using fused AdamW: {use_fused}")
 
         return optimizer
+
+    @torch.no_grad()
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
+        """
+        Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
+        the sequence max_new_tokens times, feeding the predictions back into the model each time.
+        Most likely you'll want to make sure to be in model.eval() mode of operation for this.
+        """
+        for _ in range(max_new_tokens):
+            # if the sequence context is growing too long we must crop it at block_size
+            idx_cond = idx if idx.size(1) <= self.config.max_seq_len else idx[:, -self.config.max_seq_len:]
+            # forward the model to get the logits for the index in the sequence
+            logits, _ = self(idx_cond)
+            # pluck the logits at the final step and scale by desired temperature
+            logits = logits[:, -1, :] / temperature
+            # optionally crop the logits to only the top k options
+            if top_k is not None:
+                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                logits[logits < v[:, [-1]]] = -float('Inf')
+            # apply softmax to convert logits to (normalized) probabilities
+            probs = F.softmax(logits, dim=-1)
+            # sample from the distribution
+            idx_next = torch.multinomial(probs, num_samples=1)
+            # append sampled index to the running sequence and continue
+            idx = torch.cat((idx, idx_next), dim=1)
+
+        return idx
+
 
     #def crop_block_size(self, max_seq_len):
     #    # model surgery to decrease the block size if necessary

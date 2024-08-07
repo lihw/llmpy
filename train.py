@@ -156,24 +156,8 @@ if init_from == 'scratch':
         llamaconf = LlamaConfig(**model_args)
         model = Llama(llamaconf)
     else: # gpt2
-        config1 = {"vocab_size": meta_vocab_size,
-              "n_head": n_heads,
-              "hidden_size": dim,
-              "n_layer": n_layers,
-              "n_embd": dim,
-              "n_local_heads": n_heads,
-              "n_local_kv_heads": n_heads,
-              "eps": 1e-6,
-              "max_len": max_seq_len,
-              "rope_theta": 1.0,
-              "num_key_value_heads": n_heads,
-              "attention_dropout": 0.25,
-              "rms_norm_eps": 1.0,
-              "weight_decay": 0.1,
-              "block_size": max_seq_len}
-        model = LLAMA(config1)
-        #gpt2conf = GPTConfig(**model_args)
-        #model = GPT(gpt2conf)
+        gpt2conf = GPTConfig(**model_args)
+        model = GPT(gpt2conf)
 
 #if dim < model.config.dim:
 #    model.crop_block_size(dim)
