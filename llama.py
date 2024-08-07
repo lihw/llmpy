@@ -92,12 +92,8 @@ class RotaryEmbedding(nn.Module):
         """
         super().__init__()
 
-        freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
-        t = torch.arange(end, device = freqs.device)  # type: ignore
-        freqs = torch.outer(t, freqs)  # type: ignore
-        self.freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
 
-    def reshape_for_broadcast(self, x: torch.Tensor):
+    def reshape_for_broadcast(self, freqs_cis: torch.Tensor, x: torch.Tensor):
         """
         Reshape frequency tensor for broadcasting it with another tensor.
 
@@ -117,19 +113,20 @@ class RotaryEmbedding(nn.Module):
         """
         ndim = x.ndim
         assert 1 < ndim
-        assert self.freqs_cis.shape[-1] == x.shape[-1] # freqs_cis: (max_seq_len, head_dim / 2), x: (bsz, seq_len, n_heads, head_dim / 2)
-        max_seq_len = self.freqs_cis.shape[0]
+        assert freqs_cis.shape[-1] == x.shape[-1] # freqs_cis: (max_seq_len, head_dim / 2), x: (bsz, seq_len, n_heads, head_dim / 2)
+        max_seq_len = freqs_cis.shape[0]
         seq_len = x.shape[1]
         assert  max_seq_len >= seq_len
 
         shape = [d if i == ndim - 1 else 1 for i, d in enumerate(x.shape)] # (1, seq_len, 1, head_dim / 2)
         shape[1] = max_seq_len # (1, max_seq_len, 1, head_dim / 2)
-        return self.freqs_cis.view(*shape)[:, :seq_len, :, :]
+        return freqs_cis.view(*shape)[:, :seq_len, :, :]
 
     def forward(
         self,
         xq: torch.Tensor,
         xk: torch.Tensor,
+        freqs_cis: torch.Tensor,
     ):
         """
         Apply rotary embeddings to input tensors using the given frequency tensor.
@@ -148,17 +145,13 @@ class RotaryEmbedding(nn.Module):
             Tuple[torch.Tensor, torch.Tensor]: Tuple of modified query tensor and key tensor with rotary embeddings.
         """
 
-        # in case the internal precomputed data are on the different device of current model
-        if self.freqs_cis.device != xq.device:
-            self.freqs_cis = self.freqs_cis.to(xq.device)
-
         xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2)) # (bsz, seq_len, n_heads, head_dim / 2, 2)
         xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2)) # (bsz, seq_len, n_heads, head_dim / 2, 2)
 
-        freqs_cis = self.reshape_for_broadcast(xq_) # (1, seq_len, 1, head_dim / 2)
+        f = self.reshape_for_broadcast(freqs_cis, xq_) # (1, seq_len, 1, head_dim / 2)
 
-        xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
-        xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
+        xq_out = torch.view_as_real(xq_ * f).flatten(3)
+        xk_out = torch.view_as_real(xk_ * f).flatten(3)
 
         return xq_out.type_as(xq), xk_out.type_as(xk)
 
@@ -215,6 +208,7 @@ class Attention(nn.Module):
         x: torch.Tensor,
         start_pos: int,
         mask: Optional[torch.Tensor],
+        freq_ics: torch.Tensor,
     ):
         """
         Forward pass of the attention module.
@@ -236,7 +230,7 @@ class Attention(nn.Module):
         xv = xv.view(bsz, seqlen, self.n_kv_heads, self.head_dim) # (batch, seqlen, n_heads, head_dim)
 
         # apply rotatary position relative encoding
-        xq, xk = self.rope(xq, xk)
+        xq, xk = self.rope(xq, xk, freq_ics)
 
         # add k and v to the kvcache
         #self.cache_k[:bsz, start_pos:seqlen] = xk
@@ -344,6 +338,7 @@ class LlamaLayer(nn.Module):
         x: torch.Tensor,
         start_pos: int,
         mask: Optional[torch.Tensor],
+        freq_ics: torch.Tensor
     ):
         """
         Perform a forward pass through the TransformerBlock.
@@ -358,7 +353,7 @@ class LlamaLayer(nn.Module):
 
         """
         h = x + self.attention(
-            self.attention_norm(x), start_pos, mask
+            self.attention_norm(x), start_pos, mask, freq_ics
         )
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
@@ -383,6 +378,8 @@ class Llama(nn.Module):
 
         self.apply(self._init_weights)
 
+        self.freqs_cis = None
+
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
 
     def get_num_params(self, non_embedding = True):
@@ -404,6 +401,12 @@ class Llama(nn.Module):
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def precompute_freq(self, dim: int, end: int, theta: float = 10000.0):
+        freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
+        t = torch.arange(end, device = freqs.device)  # type: ignore
+        freqs = torch.outer(t, freqs)  # type: ignore
+        return torch.polar(torch.ones_like(freqs), freqs)  # complex64
 
     def forward(self, tokens: torch.Tensor, targets: torch.Tensor = None, start_pos = 0):
         _, seqlen = tokens.shape # (batch, seqlen)
@@ -436,10 +439,13 @@ class Llama(nn.Module):
                 mask
             ]).type_as(tokens)
 
+        if self.freqs_cis is None:
+            self.freqs_cis = self.precompute_freq(self.config.dim // self.config.n_heads, self.config.max_seq_len).to(tokens.device)
+
         h = self.transformer.tok_embd(tokens) # (batch, seqlen, dim)
 
         for layer in self.transformer.layers:
-            h = layer(h, start_pos, mask)
+            h = layer(h, start_pos, mask, self.freqs_cis)
 
         h = self.transformer.norm(h)
 

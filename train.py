@@ -10,7 +10,6 @@ import torch
 
 from llama import Llama, LlamaConfig
 from gpt2 import GPT, GPTConfig
-from model import LLAMA
 
 # I/O
 out_dir = 'out'
